@@ -36,8 +36,9 @@
   //Changes The prefix tag that the script uses to search for components
   string MissileTag = "#A#";
 
-  //Warhead Automatic Detonation Range
+  //Warhead Automatic Detonation Ranges
   const float FuseDistance = 6; //automatically detonates warheads, use 23 for large grid missiles for best results!
+  const float LauncherFuseDistance = 0; //detonates once missile has traveled this distance from launcher (set >0 to enable)
 
   //Launch Parameters (both times in ticks)
   const int IGNITEDELAY = 10; //ticks before engaging the engines
@@ -748,6 +749,7 @@
 
       //Setup Variables
       List<IMyTerminalBlock> GridViewAtLaunch; //a view of the entire grid at launch
+      public Vector3D LauncherPosition;
       public double MissileMass = 0;
       public double MissileThrust = 0;
       public double MissileAccel = 10;
@@ -758,6 +760,7 @@
           //LaunchPlatformCubeGrid = (IMyCubeGrid)mergeBlock.CubeGrid;
           MERGE = mergeBlock;
           GridViewAtLaunch = gridViewAtLaunch;
+          LauncherPosition = mergeBlock.GetPosition();
           MERGE.Enabled = false;
       }
 
@@ -1020,6 +1023,18 @@
           MIS_PREV_POS = MissilePosition;
           PREV_Yaw = Yaw;
           PREV_Pitch = Pitch;
+
+
+          //Detonates warheads once missile has traveled far enough from launcher (distance-based fuse)
+          if (LauncherFuseDistance > 0 && WARHEADS.Count > 0)
+          {
+              double distanceFromLauncherSq = (MissilePosition - LauncherPosition).LengthSquared();
+              if (distanceFromLauncherSq >= LauncherFuseDistance * LauncherFuseDistance)
+              {
+                  (WARHEADS[0] as IMyWarhead).Detonate();
+                  return;
+              }
+          }
 
           //Detonates warheads in close proximity
           if ((TargetPosition - MissilePosition).LengthSquared() < (FuseDistance + 20) * (FuseDistance + 20) && WARHEADS.Count > 0) //Arms
