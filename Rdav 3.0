@@ -70,8 +70,8 @@
   string Lstrundata = "Please ensure you have read the \n setup and hints & tips, found within \n the custom data of this block\n";
   static MyGridProgram Program_local;
   int AutoLaunchTimer = 0;
-  int GuiRefreshCounter = 0;
-  const int GuiRefreshIntervalTicks = 2; //redraw every other tick to reduce UI overhead
+  TrackingDisplay.RuntimeAgs CachedRuntimeAgs = new TrackingDisplay.RuntimeAgs();
+  List<TrackingDisplay.TargetInfo> CachedDisplayTargets = new List<TrackingDisplay.TargetInfo>();
 
   //Shipside Required Blocks For Functionality
   RadarTrackingModule ThisTracker;
@@ -1319,51 +1319,45 @@
 
       //----------------------------------------------------------
 
-      //Updates The UI (throttled to reduce per-tick sprite and list allocations)
-      GuiRefreshCounter++;
-      if (GuiRefreshCounter >= GuiRefreshIntervalTicks)
+      //Updates The UI (draw every tick; reuse runtime containers to reduce allocations)
+      CachedRuntimeAgs.ReferenceLocation = RC.GetPosition();
+      CachedRuntimeAgs.ReferenceForwards = RC.WorldMatrix.Forward;
+      CachedRuntimeAgs.ReferenceUpwards = RC.WorldMatrix.Up;
+      CachedRuntimeAgs.TargetLock = HasTarget;
+      CachedRuntimeAgs.Targetmode = "RDAR";
+      CachedRuntimeAgs.Targetinfoline1 = ThisTracker.GetLine1Info();
+      CachedRuntimeAgs.Targetinfoline2 = ThisTracker.GetLine2Info();
+      CachedRuntimeAgs.MissileRemainingCount = MissileRemainingCount;
+      CachedRuntimeAgs.BoostMode = ThisTracker.BoostMode;
+      CachedDisplayTargets.Clear();
+
+      //Adds All active Missiles
+      foreach (var missile in MISSILES)
       {
-          GuiRefreshCounter = 0;
-
-          TrackingDisplay.RuntimeAgs runtimeAgs = new TrackingDisplay.RuntimeAgs();
-          runtimeAgs.ReferenceLocation = RC.GetPosition();
-          runtimeAgs.ReferenceForwards = RC.WorldMatrix.Forward;
-          runtimeAgs.ReferenceUpwards = RC.WorldMatrix.Up;
-          runtimeAgs.TargetLock = HasTarget;
-          runtimeAgs.Targetmode = "RDAR";
-          runtimeAgs.Targetinfoline1 = ThisTracker.GetLine1Info();
-          runtimeAgs.Targetinfoline2 = ThisTracker.GetLine2Info();
-          runtimeAgs.MissileRemainingCount = MissileRemainingCount;
-          runtimeAgs.ToDisplay = new List<TrackingDisplay.TargetInfo>();
-          runtimeAgs.BoostMode = ThisTracker.BoostMode;
-
-          //Adds All active Missiles
-          foreach (var missile in MISSILES)
-          {
-              if (missile.ReadyAndActive && missile.ThrustersIgnited)
-              {
-                  TrackingDisplay.TargetInfo targetInfo = new TrackingDisplay.TargetInfo();
-                  targetInfo.RenderColour = Color.RoyalBlue;
-                  targetInfo.Location = missile.WorldLocation;
-                  targetInfo.Velocity = missile.WorldVelocity * 30;
-
-                  runtimeAgs.ToDisplay.Add(targetInfo);
-              }
-          }
-
-          //Adds Target (If Tracking)
-          if (HasTarget)
+          if (missile.ReadyAndActive && missile.ThrustersIgnited)
           {
               TrackingDisplay.TargetInfo targetInfo = new TrackingDisplay.TargetInfo();
-              targetInfo.RenderColour = Color.Red;
-              targetInfo.Location = TrackedTargetLocation;
-              targetInfo.Velocity = TrackedTargetVelocity * 30;
+              targetInfo.RenderColour = Color.RoyalBlue;
+              targetInfo.Location = missile.WorldLocation;
+              targetInfo.Velocity = missile.WorldVelocity * 30;
 
-              runtimeAgs.ToDisplay.Add(targetInfo);
+              CachedDisplayTargets.Add(targetInfo);
           }
-
-          GUIPanel.DrawGUI(runtimeAgs);
       }
+
+      //Adds Target (If Tracking)
+      if (HasTarget)
+      {
+          TrackingDisplay.TargetInfo targetInfo = new TrackingDisplay.TargetInfo();
+          targetInfo.RenderColour = Color.Red;
+          targetInfo.Location = TrackedTargetLocation;
+          targetInfo.Velocity = TrackedTargetVelocity * 30;
+
+          CachedDisplayTargets.Add(targetInfo);
+      }
+
+      CachedRuntimeAgs.ToDisplay = CachedDisplayTargets;
+      GUIPanel.DrawGUI(CachedRuntimeAgs);
 
 
       //Begins Launch Scheduler
