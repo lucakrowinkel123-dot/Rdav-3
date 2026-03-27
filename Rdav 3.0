@@ -56,6 +56,9 @@
   bool Autoconnect = false;//Automatically connects missile connectors so its easier to use in survival
   bool OnlyUseBlocksOnSameConstruct = false; //Use this to force script to only use same construct blocks (ie ignore connector docked stuff)
   bool OrderedLaunching = false; //script will automatically launch ordered via name, (the order they appear in the terminal) use #A# 001, #A# 002, ...., #A# 099
+  bool EnableHubFeed = true; //Enable IGC target feed from a Vetile hub
+  string HubChannel = "RDAV_HUB_BUS"; //IGC channel for hub and tracker traffic
+  int HubFeedStaleTimeoutTicks = 60; //how long before remote feed is considered stale
 
   //-------------- Don't Touch Anything Beneath This Line --------------------
 
@@ -72,6 +75,12 @@
   int AutoLaunchTimer = 0;
   int GuiRefreshCounter = 0;
   const int GuiRefreshIntervalTicks = 2; //redraw every other tick to reduce UI overhead
+  IMyBroadcastListener HubFeedListener;
+  bool HubFeedHasLock = false;
+  long HubFeedTick = -999999;
+  string HubFeedTargetName = "";
+  string HubFeedSourceName = "";
+  bool HubFeedPresent = false;
 
   //Shipside Required Blocks For Functionality
   RadarTrackingModule ThisTracker;
@@ -1154,6 +1163,11 @@
 
       //Sets Runtime
       Runtime.UpdateFrequency = UpdateFrequency.Update1;
+      if (EnableHubFeed)
+      {
+          HubFeedListener = IGC.RegisterBroadcastListener(HubChannel);
+          HubFeedListener.SetMessageCallback("hubfeed");
+      }
 
       //Setup String
       string SetupString = "Rdavs Guided Missile Script Basic Setup \n================================================== \n \n \nSystem Setup \n=================== \n \nTo Set Up The Ship: \n------------------------ \n- Put this Code Into a P-block \n- Install a light block (optional) \n- Install an Offensive combat block & Flight Block called #A#  \n- Recompile if prompted to 'reset' \n- To fire from the toolbar 'run' this Pb with \n  the argument 'Fire'";
@@ -1220,6 +1234,52 @@
   }
   #endregion
 
+  void ProcessHubFeedMessages()
+  {
+      if (!EnableHubFeed || HubFeedListener == null)
+          return;
+
+      while (HubFeedListener.HasPendingMessage)
+      {
+          MyIGCMessage message = HubFeedListener.AcceptMessage();
+          string data = message.Data as string;
+          if (string.IsNullOrWhiteSpace(data))
+              continue;
+
+          string[] parts = data.Split('|');
+          if (parts.Length < 12)
+              continue;
+          if (parts[0] != "RDAV_FEED")
+              continue;
+          if (parts[1] != MissileTag)
+              continue;
+
+          double px, py, pz, vx, vy, vz;
+          long tick;
+          if (!double.TryParse(parts[3], out px) || !double.TryParse(parts[4], out py) || !double.TryParse(parts[5], out pz))
+              continue;
+          if (!double.TryParse(parts[6], out vx) || !double.TryParse(parts[7], out vy) || !double.TryParse(parts[8], out vz))
+              continue;
+          if (!long.TryParse(parts[10], out tick))
+              continue;
+
+          HubFeedHasLock = parts[2] == "1";
+          TrackedTargetLocation = new Vector3D(px, py, pz);
+          TrackedTargetVelocity = new Vector3D(vx, vy, vz);
+          HubFeedTargetName = parts[9];
+          HubFeedSourceName = parts[11];
+          HubFeedTick = Runtime.LifetimeTicks;
+          HubFeedPresent = true;
+      }
+  }
+
+  bool IsHubFeedFresh()
+  {
+      if (!EnableHubFeed || !HubFeedPresent)
+          return false;
+      return (Runtime.LifetimeTicks - HubFeedTick) <= HubFeedStaleTimeoutTicks;
+  }
+
   //Main Method
   #region Main Method
   void Main(string argument)
@@ -1243,7 +1303,7 @@
       //Core Block Checks
       if (RC == null || RC.CubeGrid.GetCubeBlock(RC.Position) == null)
       { Echo(" ~ No Ship Control Found,\nInstall Forward Facing Cockpit/RC/Flightseat And Press Recompile"); RC = null; return; }
-      if (ThisTracker == null)
+      if (ThisTracker == null && !EnableHubFeed)
       { Echo("No Target Tracking System Found\n> Make sure a combat AI block and flight AI block are installed and both have '#A#' in the name\n> Then press Recompile."); return; }
       if (GUIPanel == null)
       { Echo("No GUI Display Found\n> Install an LCD or cockpit screen with name containing the MissileTag \n> Then press Recompile."); return; }
@@ -1255,18 +1315,39 @@
       //--------------------------------------
 
       //Updates Tracking System
-      ThisTracker.UpdateTracking(Runtime.LifetimeTicks); //DateTime.Now.Ticks
+      ProcessHubFeedMessages();
+      bool HubFresh = IsHubFeedFresh();
+      if (ThisTracker != null)
+      {
+          ThisTracker.UpdateTracking(Runtime.LifetimeTicks); //DateTime.Now.Ticks
+      }
 
       //Toggles LockOn
-      bool HasTarget = ThisTracker.IsTracking; //If Turret Detects Enemy
+      bool HasTarget = false;
+      if (HubFresh)
+      {
+          HasTarget = HubFeedHasLock;
+      }
+      else if (ThisTracker != null)
+      {
+          HasTarget = ThisTracker.IsTracking; //If Turret Detects Enemy
+      }
 
       //Updates Track Location
       if (HasTarget)
       {
-          TrackedTargetLocation = ThisTracker.TargetPosition;
-          TrackedTargetVelocity = ThisTracker.TargetVelocity;
-          Lstrundata = "TARGET LOCKED\n" + ThisTracker.TrackedObjectName;
-          Lstrundata += "\nBoost: " + ThisTracker.BoostMode;
+          if (HubFresh)
+          {
+              Lstrundata = "TARGET LOCKED\n" + HubFeedTargetName;
+              Lstrundata += "\nFeed: " + HubFeedSourceName;
+          }
+          else
+          {
+              TrackedTargetLocation = ThisTracker.TargetPosition;
+              TrackedTargetVelocity = ThisTracker.TargetVelocity;
+              Lstrundata = "TARGET LOCKED\n" + ThisTracker.TrackedObjectName;
+              Lstrundata += "\nBoost: " + ThisTracker.BoostMode;
+          }
           //Ifdebug
           //BoundingSphere spher = new BoundingSphere(TrackedTargetLocation, 2.5f);
           //debug.DrawSphere(spher, Color.SkyBlue, DebugAPI.Style.Wireframe);
@@ -1330,12 +1411,12 @@
           runtimeAgs.ReferenceForwards = RC.WorldMatrix.Forward;
           runtimeAgs.ReferenceUpwards = RC.WorldMatrix.Up;
           runtimeAgs.TargetLock = HasTarget;
-          runtimeAgs.Targetmode = "RDAR";
-          runtimeAgs.Targetinfoline1 = ThisTracker.GetLine1Info();
-          runtimeAgs.Targetinfoline2 = ThisTracker.GetLine2Info();
+          runtimeAgs.Targetmode = HubFresh ? "HUB" : "RDAR";
+          runtimeAgs.Targetinfoline1 = HubFresh ? HubFeedSourceName : (ThisTracker != null ? ThisTracker.GetLine1Info() : "N/A");
+          runtimeAgs.Targetinfoline2 = HubFresh ? HubFeedTargetName : (ThisTracker != null ? ThisTracker.GetLine2Info() : "N/A");
           runtimeAgs.MissileRemainingCount = MissileRemainingCount;
           runtimeAgs.ToDisplay = new List<TrackingDisplay.TargetInfo>();
-          runtimeAgs.BoostMode = ThisTracker.BoostMode;
+          runtimeAgs.BoostMode = ThisTracker != null && ThisTracker.BoostMode;
 
           //Adds All active Missiles
           foreach (var missile in MISSILES)
@@ -1374,7 +1455,10 @@
       }
       if (argument == "Boost")
       {
-          ThisTracker.BoostMode = !ThisTracker.BoostMode;
+          if (ThisTracker != null)
+          {
+              ThisTracker.BoostMode = !ThisTracker.BoostMode;
+          }
       }
       if (argument != "Fire" && argument != "Boost" && argument != "")
       {

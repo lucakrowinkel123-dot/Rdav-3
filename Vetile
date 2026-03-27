@@ -25,6 +25,7 @@ const double WARHEAD_RANGE_CHECK_SECONDS = 10.0;
 const double WARHEAD_MAX_DISTANCE_METERS = 3000.0;
 const double SUMMARY_LCD_UPDATE_SECONDS = 0.5;
 const string ALERT_SOUND_NAME = "Alert 2";
+const string DEFAULT_HUB_CHANNEL = "RDAV_HUB_BUS";
 
 enum ControllerState
 {
@@ -48,6 +49,7 @@ class TagChannel
     public IMyMotorStator Rotor;
     public IMyShipWelder Welder;
     public IMyProgrammableBlock FireTargetPb;
+    public IMyFlightMovementBlock FlightBlock;
     public List<IMyOffensiveCombatBlock> CombatBlocks = new List<IMyOffensiveCombatBlock>();
     public List<IMyShipConnector> Connectors = new List<IMyShipConnector>();
     public List<IMyGasTank> Tanks = new List<IMyGasTank>();
@@ -66,6 +68,18 @@ class TagChannel
     public TagChannel(string tag) { Tag = tag; }
 }
 
+class FeedState
+{
+    public bool HasLock;
+    public Vector3D Position;
+    public Vector3D Velocity;
+    public string TargetName = "";
+    public long Tick;
+    public string SourceId = "";
+    public bool IsValid;
+    public bool IsRemote;
+}
+
 Dictionary<string, TagChannel> channels = new Dictionary<string, TagChannel>();
 double elapsedSeconds;
 IMyTextPanel summaryLcd;
@@ -79,6 +93,16 @@ double fireAllElapsed;
 double warheadRangeCheckTimer;
 int warheadRangeCheckTagIndex;
 double summaryLcdTimer;
+string hubChannel = DEFAULT_HUB_CHANNEL;
+int feedIntervalTicks = 1;
+int staleTimeoutTicks = 60;
+string activeSourceId = "";
+HashSet<string> configuredRemoteSources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+IMyBroadcastListener hubListener;
+FeedState activeFeed = new FeedState();
+int feedPublishCounter;
+long currentTick;
+string subsystemMode = "all";
 
 public Program()
 {
@@ -91,6 +115,8 @@ public Program()
     LoadSummaryLcd();
     LoadAlertSoundBlock();
     LoadNavController();
+    LoadHubConfig();
+    RegisterHubListener();
 }
 
 public void Save() { }
@@ -98,6 +124,7 @@ public void Save() { }
 public void Main(string argument, UpdateType updateSource)
 {
     elapsedSeconds += Runtime.TimeSinceLastRun.TotalSeconds;
+    currentTick++;
 
     if (!string.IsNullOrWhiteSpace(argument))
     {
@@ -107,6 +134,8 @@ public void Main(string argument, UpdateType updateSource)
             LoadSummaryLcd();
             LoadAlertSoundBlock();
             LoadNavController();
+            LoadHubConfig();
+            RegisterHubListener();
         }
         else if (argument.Equals("reset", StringComparison.OrdinalIgnoreCase))
             ResetAll();
@@ -140,7 +169,15 @@ public void Main(string argument, UpdateType updateSource)
             ForceStartAll();
             return;
         }
+        else if (HandleHubCommand(argument))
+        {
+            return;
+        }
     }
+
+    ProcessIncomingHubMessages();
+    RefreshActiveFeed();
+    PublishFeedToRdav();
 
     foreach (var kv in channels)
         UpdateChannel(kv.Value);
@@ -166,6 +203,66 @@ public void Main(string argument, UpdateType updateSource)
     }
 
     UpdateRuntimeFrequency();
+}
+
+bool HandleHubCommand(string argument)
+{
+    var parts = argument.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length == 0)
+        return false;
+
+    if (parts[0].Equals("source", StringComparison.OrdinalIgnoreCase))
+    {
+        if (parts.Length >= 3 && parts[1].Equals("set", StringComparison.OrdinalIgnoreCase))
+        {
+            SetActiveSource(parts[2]);
+            return true;
+        }
+
+        if (parts.Length >= 2 && parts[1].Equals("list", StringComparison.OrdinalIgnoreCase))
+        {
+            Echo("Sources: local tags #A#,#B#,#C#,#D# plus configured remotes.");
+            foreach (var source in configuredRemoteSources)
+                Echo(" - " + source);
+            return true;
+        }
+
+        if (parts.Length >= 2 && parts[1].Equals("active", StringComparison.OrdinalIgnoreCase))
+        {
+            Echo("Active source: " + (string.IsNullOrWhiteSpace(activeSourceId) ? "<none>" : activeSourceId));
+            return true;
+        }
+    }
+
+    if (parts[0].Equals("subsystem", StringComparison.OrdinalIgnoreCase) && parts.Length >= 2)
+    {
+        subsystemMode = parts[1].ToLowerInvariant();
+        ApplySubsystemModeAll();
+        SendPolicyToActiveSource();
+        UpdateSummaryLcd();
+        Echo("Subsystem mode: " + subsystemMode);
+        return true;
+    }
+
+    if (parts[0].Equals("priority", StringComparison.OrdinalIgnoreCase) && parts.Length >= 2)
+    {
+        if (TryParsePriority(parts[1], out var parsed))
+        {
+            globalTargetMode = parsed;
+            foreach (var kv in channels)
+                ApplyTargetPriority(kv.Value);
+            SendPolicyToActiveSource();
+            UpdateSummaryLcd();
+            Echo("Priority: " + globalTargetMode);
+        }
+        else
+        {
+            Echo("Unknown priority. Use closest|largest|smallest");
+        }
+        return true;
+    }
+
+    return false;
 }
 
 void ForceStartAll()
@@ -263,6 +360,7 @@ void CycleTargetPriorityAll()
     foreach (var kv in channels)
         ApplyTargetPriority(kv.Value);
 
+    SendPolicyToActiveSource();
     UpdateSummaryLcd();
 }
 
@@ -290,11 +388,105 @@ void ApplyTargetPriority(TagChannel ch)
     }
 }
 
+bool TryParsePriority(string raw, out TargetPriorityMode mode)
+{
+    string v = (raw ?? "").Trim().ToLowerInvariant();
+    if (v == "closest") { mode = TargetPriorityMode.Closest; return true; }
+    if (v == "largest") { mode = TargetPriorityMode.Largest; return true; }
+    if (v == "smallest") { mode = TargetPriorityMode.Smallest; return true; }
+    mode = TargetPriorityMode.Largest;
+    return false;
+}
+
+void ApplySubsystemModeAll()
+{
+    foreach (var kv in channels)
+        ApplySubsystemMode(kv.Value);
+}
+
+void ApplySubsystemMode(TagChannel ch)
+{
+    if (ch.CombatBlocks == null || ch.CombatBlocks.Count == 0)
+        return;
+
+    string action = SubsystemModeToAction(subsystemMode);
+    if (string.IsNullOrWhiteSpace(action))
+        return;
+
+    for (int i = 0; i < ch.CombatBlocks.Count; i++)
+    {
+        var block = ch.CombatBlocks[i];
+        if (block != null)
+            block.ApplyAction(action);
+    }
+}
+
+string SubsystemModeToAction(string mode)
+{
+    string v = (mode ?? "").Trim().ToLowerInvariant();
+    if (v == "weapons") return "SetTargetingGroup_Weapons";
+    if (v == "thrusters") return "SetTargetingGroup_Propulsion";
+    if (v == "power") return "SetTargetingGroup_PowerSystems";
+    if (v == "jump") return "SetTargetingGroup_JumpDrives";
+    return "SetTargetingGroup_Default";
+}
+
 void LoadSummaryLcd()
 {
     var lcds = new List<IMyTextPanel>();
     GridTerminalSystem.GetBlocksOfType(lcds, b => b.CustomName != null && b.CustomName.IndexOf(SUMMARY_LCD_TAG, StringComparison.OrdinalIgnoreCase) >= 0);
     summaryLcd = lcds.Count > 0 ? lcds[0] : null;
+}
+
+void LoadHubConfig()
+{
+    if (Me == null)
+        return;
+
+    if (string.IsNullOrWhiteSpace(Me.CustomData))
+    {
+        Me.CustomData =
+            "[Hub]\n" +
+            "Channel=RDAV_HUB_BUS\n" +
+            "FeedIntervalTicks=1\n" +
+            "StaleTimeoutTicks=60\n" +
+            "ActiveSource=#A#\n" +
+            "RemoteSources=Weab,Biscuito,Moreytorium\n" +
+            "Priority=largest\n" +
+            "Subsystem=all\n";
+    }
+
+    var map = ParseIniLike(Me.CustomData);
+    hubChannel = GetOrDefault(map, "channel", DEFAULT_HUB_CHANNEL);
+    feedIntervalTicks = Math.Max(1, ParseInt(GetOrDefault(map, "feedintervalticks", "1"), 1));
+    staleTimeoutTicks = Math.Max(1, ParseInt(GetOrDefault(map, "staletimeoutticks", "60"), 60));
+    activeSourceId = GetOrDefault(map, "activesource", activeSourceId);
+    if (string.IsNullOrWhiteSpace(activeSourceId))
+        activeSourceId = "#A#";
+    subsystemMode = GetOrDefault(map, "subsystem", subsystemMode).ToLowerInvariant();
+
+    if (TryParsePriority(GetOrDefault(map, "priority", globalTargetMode.ToString()), out var parsedMode))
+        globalTargetMode = parsedMode;
+
+    configuredRemoteSources.Clear();
+    foreach (var item in SplitCsv(GetOrDefault(map, "remotesources", "")))
+        configuredRemoteSources.Add(item);
+
+    foreach (var kv in channels)
+    {
+        ApplyTargetPriority(kv.Value);
+        ApplySubsystemMode(kv.Value);
+    }
+
+    SetActiveSource(activeSourceId);
+}
+
+void RegisterHubListener()
+{
+    if (string.IsNullOrWhiteSpace(hubChannel))
+        hubChannel = DEFAULT_HUB_CHANNEL;
+    hubListener = IGC.RegisterBroadcastListener(hubChannel);
+    hubListener.SetMessageCallback("hub");
 }
 
 void LoadAlertSoundBlock()
@@ -332,6 +524,11 @@ void UpdateSummaryLcd()
 
     var text = new StringBuilder();
     text.AppendLine($"Target Priority: {globalTargetMode}");
+    text.AppendLine($"Target Subsystem: {subsystemMode}");
+    text.AppendLine($"Active Source: {(string.IsNullOrWhiteSpace(activeSourceId) ? "<none>" : activeSourceId)}");
+    text.AppendLine($"Lock: {(activeFeed.IsValid && activeFeed.HasLock ? "YES" : "NO")}");
+    text.AppendLine($"Target: {(activeFeed.IsValid ? activeFeed.TargetName : "<none>")}");
+    text.AppendLine($"Feed age: {(activeFeed.IsValid ? (currentTick - activeFeed.Tick).ToString() : "-")} ticks");
     text.AppendLine();
 
     for (int i = 0; i < TAGS.Length; i++)
@@ -347,6 +544,268 @@ void UpdateSummaryLcd()
     }
 
     summaryLcd.WriteText(text.ToString(), false);
+}
+
+void ProcessIncomingHubMessages()
+{
+    if (hubListener == null)
+        return;
+
+    while (hubListener.HasPendingMessage)
+    {
+        var message = hubListener.AcceptMessage();
+        string raw = message.Data as string;
+        if (string.IsNullOrWhiteSpace(raw))
+            continue;
+
+        var parts = raw.Split('|');
+        if (parts.Length < 2)
+            continue;
+
+        if (!parts[0].Equals("TRACKER_FEED", StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        string sender = parts[1];
+        if (!sender.Equals(activeSourceId, StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        FeedState parsed;
+        if (!TryParseTrackerFeed(parts, out parsed))
+            continue;
+
+        parsed.SourceId = sender;
+        parsed.IsValid = true;
+        parsed.IsRemote = true;
+        activeFeed = parsed;
+    }
+}
+
+void RefreshActiveFeed()
+{
+    if (string.IsNullOrWhiteSpace(activeSourceId))
+        return;
+
+    if (IsLocalTagSource(activeSourceId))
+    {
+        FeedState localFeed;
+        if (TryGetLocalFeed(activeSourceId, out localFeed))
+            activeFeed = localFeed;
+        return;
+    }
+
+    // remote source: stale timeout handling
+    if (!activeFeed.IsValid || !activeFeed.SourceId.Equals(activeSourceId, StringComparison.OrdinalIgnoreCase))
+        return;
+
+    if ((currentTick - activeFeed.Tick) > staleTimeoutTicks)
+    {
+        activeFeed.IsValid = false;
+        activeFeed.HasLock = false;
+    }
+}
+
+void PublishFeedToRdav()
+{
+    if (!activeFeed.IsValid)
+        return;
+
+    feedPublishCounter++;
+    if (feedPublishCounter < feedIntervalTicks)
+        return;
+    feedPublishCounter = 0;
+
+    for (int i = 0; i < TAGS.Length; i++)
+    {
+        string msg = BuildRdavFeedMessage(TAGS[i], activeFeed);
+        IGC.SendBroadcastMessage(hubChannel, msg);
+    }
+}
+
+string BuildRdavFeedMessage(string tag, FeedState feed)
+{
+    return string.Join("|", new[]
+    {
+        "RDAV_FEED",
+        tag,
+        feed.HasLock ? "1" : "0",
+        feed.Position.X.ToString("R"),
+        feed.Position.Y.ToString("R"),
+        feed.Position.Z.ToString("R"),
+        feed.Velocity.X.ToString("R"),
+        feed.Velocity.Y.ToString("R"),
+        feed.Velocity.Z.ToString("R"),
+        SanitizePipe(feed.TargetName),
+        currentTick.ToString(),
+        SanitizePipe(feed.SourceId)
+    });
+}
+
+bool TryParseTrackerFeed(string[] parts, out FeedState feed)
+{
+    feed = new FeedState();
+    if (parts.Length < 11)
+        return false;
+
+    double px, py, pz, vx, vy, vz;
+    long tick;
+    if (!double.TryParse(parts[3], out px) ||
+        !double.TryParse(parts[4], out py) ||
+        !double.TryParse(parts[5], out pz) ||
+        !double.TryParse(parts[6], out vx) ||
+        !double.TryParse(parts[7], out vy) ||
+        !double.TryParse(parts[8], out vz) ||
+        !long.TryParse(parts[10], out tick))
+        return false;
+
+    feed.HasLock = parts[2] == "1";
+    feed.Position = new Vector3D(px, py, pz);
+    feed.Velocity = new Vector3D(vx, vy, vz);
+    feed.TargetName = parts[9];
+    feed.Tick = tick;
+    return true;
+}
+
+bool TryGetLocalFeed(string sourceTag, out FeedState feed)
+{
+    feed = new FeedState();
+    TagChannel ch;
+    if (!channels.TryGetValue(sourceTag, out ch))
+        return false;
+
+    if (ch.FlightBlock == null || ch.CombatBlocks == null || ch.CombatBlocks.Count == 0)
+        return false;
+
+    var waypoint = ch.FlightBlock.CurrentWaypoint;
+    if (waypoint == null)
+        return false;
+
+    Vector3D pos = waypoint.Matrix.Translation;
+    Vector3D vel = Vector3D.Zero;
+
+    // basic velocity from previous published feed for same local source
+    if (activeFeed.IsValid && activeFeed.SourceId.Equals(sourceTag, StringComparison.OrdinalIgnoreCase))
+        vel = (pos - activeFeed.Position);
+
+    feed.Position = pos;
+    feed.Velocity = vel;
+    var combat = ch.CombatBlocks[0];
+    feed.HasLock = combat != null && combat.SearchEnemyComponent.FoundEnemyId != null;
+    feed.TargetName = combat != null ? FirstLine(combat.DetailedInfo) : "";
+    feed.Tick = currentTick;
+    feed.SourceId = sourceTag;
+    feed.IsValid = true;
+    feed.IsRemote = false;
+    return true;
+}
+
+void SetActiveSource(string sourceId)
+{
+    if (string.IsNullOrWhiteSpace(sourceId))
+        return;
+
+    string old = activeSourceId;
+    activeSourceId = sourceId.Trim();
+    activeFeed = new FeedState();
+
+    if (!string.IsNullOrWhiteSpace(old) && !IsLocalTagSource(old))
+        SendTrackerCommand(old, "TRACKER_STANDBY");
+
+    if (!IsLocalTagSource(activeSourceId))
+    {
+        SendTrackerCommand(activeSourceId, "TRACKER_ARM");
+        SendPolicyToActiveSource();
+    }
+
+    Echo("Active source -> " + activeSourceId);
+    UpdateSummaryLcd();
+}
+
+void SendPolicyToActiveSource()
+{
+    if (string.IsNullOrWhiteSpace(activeSourceId) || IsLocalTagSource(activeSourceId))
+        return;
+
+    SendTrackerCommand(activeSourceId, "TRACKER_SET_POLICY|" + globalTargetMode.ToString().ToLowerInvariant() + "|" + subsystemMode);
+}
+
+void SendTrackerCommand(string sourceId, string command)
+{
+    if (string.IsNullOrWhiteSpace(sourceId))
+        return;
+    string msg = "TRACKER_CMD|" + sourceId + "|" + command;
+    IGC.SendBroadcastMessage(hubChannel, msg);
+}
+
+bool IsLocalTagSource(string sourceId)
+{
+    return channels.ContainsKey(sourceId);
+}
+
+string FirstLine(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return "";
+    int idx = text.IndexOf('\n');
+    return idx < 0 ? text : text.Substring(0, idx);
+}
+
+string SanitizePipe(string text)
+{
+    return (text ?? "").Replace("|", "/");
+}
+
+Dictionary<string, string> ParseIniLike(string raw)
+{
+    var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    if (string.IsNullOrWhiteSpace(raw))
+        return map;
+
+    var lines = raw.Split('\n');
+    for (int i = 0; i < lines.Length; i++)
+    {
+        string line = lines[i];
+        if (line == null) continue;
+        line = line.Trim();
+        if (line.Length == 0 || line.StartsWith(";") || line.StartsWith("#") || line.StartsWith("["))
+            continue;
+        int eq = line.IndexOf('=');
+        if (eq <= 0) continue;
+        string key = line.Substring(0, eq).Trim();
+        string value = line.Substring(eq + 1).Trim();
+        map[key] = value;
+    }
+    return map;
+}
+
+string GetOrDefault(Dictionary<string, string> map, string key, string fallback)
+{
+    string value;
+    if (map.TryGetValue(key, out value) && !string.IsNullOrWhiteSpace(value))
+        return value;
+    return fallback;
+}
+
+int ParseInt(string raw, int fallback)
+{
+    int v;
+    if (int.TryParse(raw, out v))
+        return v;
+    return fallback;
+}
+
+List<string> SplitCsv(string raw)
+{
+    var list = new List<string>();
+    if (string.IsNullOrWhiteSpace(raw))
+        return list;
+    var parts = raw.Split(',');
+    for (int i = 0; i < parts.Length; i++)
+    {
+        string p = parts[i].Trim();
+        if (p.Length > 0)
+            list.Add(p);
+    }
+    return list;
 }
 
 void AutoDetonateOutOfRangeWarheadsNextTag()
@@ -744,6 +1203,7 @@ void LoadBlocksForChannel(TagChannel ch)
 {
     var projectors = new List<IMyProjector>();
     var rotors = new List<IMyMotorStator>();
+    var flightBlocks = new List<IMyFlightMovementBlock>();
     ch.CombatBlocks.Clear();
     var welders = new List<IMyShipWelder>();
     var taggedPbs = new List<IMyProgrammableBlock>();
@@ -751,12 +1211,14 @@ void LoadBlocksForChannel(TagChannel ch)
     GridTerminalSystem.GetBlocksOfType(projectors, b => NameHasTag(b.CustomName, ch.Tag));
     GridTerminalSystem.GetBlocksOfType(rotors, b => NameHasTag(b.CustomName, ch.Tag));
     GridTerminalSystem.GetBlocksOfType(welders, b => NameHasTag(b.CustomName, ch.Tag));
+    GridTerminalSystem.GetBlocksOfType(flightBlocks, b => NameHasTag(b.CustomName, ch.Tag));
     GridTerminalSystem.GetBlocksOfType(taggedPbs, b => NameHasTag(b.CustomName, ch.Tag));
     GridTerminalSystem.GetBlocksOfType(ch.CombatBlocks, b => NameHasTag(b.CustomName, ch.Tag));
 
     ch.Projector = projectors.Count > 0 ? projectors[0] : null;
     ch.Rotor = rotors.Count > 0 ? rotors[0] : null;
     ch.Welder = welders.Count > 0 ? welders[0] : null;
+    ch.FlightBlock = flightBlocks.Count > 0 ? flightBlocks[0] : null;
     ch.FireTargetPb = null;
 
     for (int i = 0; i < taggedPbs.Count; i++)
@@ -772,6 +1234,7 @@ void LoadBlocksForChannel(TagChannel ch)
     UpdateTankCache(ch, true);
     ch.WasTanksFilled = ch.TanksFilledCached;
     ApplyTargetPriority(ch);
+    ApplySubsystemMode(ch);
 }
 
 bool NameHasTag(string name, string tag)
@@ -843,6 +1306,8 @@ double NormalizeToMinusPiToPi(double radians)
 void EchoSummary()
 {
     Echo("Rotor Projection Finisher (Multi-Tag)");
+    Echo($"Hub Source: {(string.IsNullOrWhiteSpace(activeSourceId) ? "<none>" : activeSourceId)} | Priority {globalTargetMode} | Subsystem {subsystemMode}");
+    Echo($"Feed: {(activeFeed.IsValid ? "VALID" : "NONE")} | Lock {(activeFeed.IsValid && activeFeed.HasLock ? "YES" : "NO")} | Target {(activeFeed.IsValid ? activeFeed.TargetName : "<none>")}");
 
     for (int i = 0; i < TAGS.Length; i++)
     {

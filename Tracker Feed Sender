@@ -1,0 +1,270 @@
+// Space Engineers programmable block script
+// Sends TRACKER_FEED packets for Vetile hub consumption.
+
+const string DEFAULT_CHANNEL = "RDAV_HUB_BUS";
+const string DEFAULT_SOURCE_TAG = "#A#";
+const int DEFAULT_FEED_INTERVAL_TICKS = 1;
+
+string HubChannel = DEFAULT_CHANNEL;
+string SourceId = "";
+string SourceTag = DEFAULT_SOURCE_TAG;
+int FeedIntervalTicks = DEFAULT_FEED_INTERVAL_TICKS;
+
+IMyBroadcastListener HubListener;
+IMyFlightMovementBlock FlightBlock;
+IMyOffensiveCombatBlock CombatBlock;
+
+bool Armed;
+long TickCounter;
+int FeedCounter;
+Vector3D LastPosition;
+bool HasLastPosition;
+
+public Program()
+{
+    Runtime.UpdateFrequency = UpdateFrequency.Update10;
+    LoadConfig();
+    RefreshBlocks();
+    RegisterListener();
+}
+
+public void Save() { }
+
+public void Main(string argument, UpdateType updateSource)
+{
+    TickCounter++;
+
+    if (!string.IsNullOrWhiteSpace(argument))
+        HandleManualArgument(argument);
+
+    ProcessHubMessages();
+
+    if (Armed)
+        TrySendFeed();
+
+    EchoStatus();
+}
+
+void LoadConfig()
+{
+    if (string.IsNullOrWhiteSpace(Me.CustomData))
+    {
+        Me.CustomData =
+            "Channel=RDAV_HUB_BUS\n" +
+            "SourceId=Weab\n" +
+            "SourceTag=#A#\n" +
+            "FeedIntervalTicks=1\n";
+    }
+
+    var map = ParseKv(Me.CustomData);
+    HubChannel = GetOrDefault(map, "channel", DEFAULT_CHANNEL);
+    SourceId = GetOrDefault(map, "sourceid", Me.CustomName);
+    SourceTag = GetOrDefault(map, "sourcetag", DEFAULT_SOURCE_TAG);
+    FeedIntervalTicks = Math.Max(1, ParseInt(GetOrDefault(map, "feedintervalticks", "1"), 1));
+}
+
+void RegisterListener()
+{
+    HubListener = IGC.RegisterBroadcastListener(HubChannel);
+    HubListener.SetMessageCallback("trackerhub");
+}
+
+void RefreshBlocks()
+{
+    var flights = new List<IMyFlightMovementBlock>();
+    GridTerminalSystem.GetBlocksOfType(flights, b => NameHasTag(b.CustomName, SourceTag));
+    FlightBlock = flights.Count > 0 ? flights[0] : null;
+
+    var combats = new List<IMyOffensiveCombatBlock>();
+    GridTerminalSystem.GetBlocksOfType(combats, b => NameHasTag(b.CustomName, SourceTag));
+    CombatBlock = combats.Count > 0 ? combats[0] : null;
+}
+
+void HandleManualArgument(string argument)
+{
+    var parts = argument.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length == 0)
+        return;
+
+    if (parts[0].Equals("refresh", StringComparison.OrdinalIgnoreCase))
+    {
+        LoadConfig();
+        RefreshBlocks();
+        RegisterListener();
+        return;
+    }
+
+    if (parts[0].Equals("arm", StringComparison.OrdinalIgnoreCase))
+    {
+        Armed = true;
+        return;
+    }
+
+    if (parts[0].Equals("standby", StringComparison.OrdinalIgnoreCase))
+    {
+        Armed = false;
+        return;
+    }
+}
+
+void ProcessHubMessages()
+{
+    if (HubListener == null)
+        return;
+
+    while (HubListener.HasPendingMessage)
+    {
+        var msg = HubListener.AcceptMessage();
+        string raw = msg.Data as string;
+        if (string.IsNullOrWhiteSpace(raw))
+            continue;
+
+        var parts = raw.Split('|');
+        if (parts.Length < 3)
+            continue;
+
+        if (!parts[0].Equals("TRACKER_CMD", StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        if (!parts[1].Equals(SourceId, StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        string command = parts[2];
+        if (command.Equals("TRACKER_ARM", StringComparison.OrdinalIgnoreCase))
+        {
+            Armed = true;
+        }
+        else if (command.Equals("TRACKER_STANDBY", StringComparison.OrdinalIgnoreCase))
+        {
+            Armed = false;
+        }
+        else if (command.StartsWith("TRACKER_SET_POLICY", StringComparison.OrdinalIgnoreCase))
+        {
+            ApplyPolicyFromParts(parts);
+        }
+    }
+}
+
+void ApplyPolicyFromParts(string[] parts)
+{
+    // TRACKER_CMD|<SourceId>|TRACKER_SET_POLICY|priority|subsystem
+    if (parts == null || parts.Length < 5 || CombatBlock == null)
+        return;
+
+    string priority = parts[3].ToLowerInvariant();
+    string subsystem = parts[4].ToLowerInvariant();
+
+    if (priority == "closest") CombatBlock.ApplyAction("SetTargetPriority_Closest");
+    else if (priority == "smallest") CombatBlock.ApplyAction("SetTargetPriority_Smallest");
+    else CombatBlock.ApplyAction("SetTargetPriority_Largest");
+
+    if (subsystem == "weapons") CombatBlock.ApplyAction("SetTargetingGroup_Weapons");
+    else if (subsystem == "thrusters") CombatBlock.ApplyAction("SetTargetingGroup_Propulsion");
+    else if (subsystem == "power") CombatBlock.ApplyAction("SetTargetingGroup_PowerSystems");
+    else if (subsystem == "jump") CombatBlock.ApplyAction("SetTargetingGroup_JumpDrives");
+    else CombatBlock.ApplyAction("SetTargetingGroup_Default");
+}
+
+void TrySendFeed()
+{
+    if (FlightBlock == null || CombatBlock == null)
+        return;
+
+    FeedCounter++;
+    if (FeedCounter < FeedIntervalTicks)
+        return;
+    FeedCounter = 0;
+
+    var waypoint = FlightBlock.CurrentWaypoint;
+    if (waypoint == null)
+        return;
+
+    Vector3D pos = waypoint.Matrix.Translation;
+    Vector3D vel = Vector3D.Zero;
+    if (HasLastPosition)
+        vel = pos - LastPosition;
+
+    LastPosition = pos;
+    HasLastPosition = true;
+
+    bool hasLock = CombatBlock.SearchEnemyComponent.FoundEnemyId != null;
+    string targetName = FirstLine(CombatBlock.DetailedInfo);
+
+    string packet = string.Join("|", new[]
+    {
+        "TRACKER_FEED",
+        SourceId,
+        hasLock ? "1" : "0",
+        pos.X.ToString("R"),
+        pos.Y.ToString("R"),
+        pos.Z.ToString("R"),
+        vel.X.ToString("R"),
+        vel.Y.ToString("R"),
+        vel.Z.ToString("R"),
+        SanitizePipe(targetName),
+        TickCounter.ToString()
+    });
+
+    IGC.SendBroadcastMessage(HubChannel, packet);
+}
+
+void EchoStatus()
+{
+    Echo("Tracker Feed Sender");
+    Echo("SourceId: " + SourceId);
+    Echo("Tag: " + SourceTag);
+    Echo("Channel: " + HubChannel);
+    Echo("Armed: " + Armed);
+    Echo("Flight: " + (FlightBlock != null ? "OK" : "MISSING"));
+    Echo("Combat: " + (CombatBlock != null ? "OK" : "MISSING"));
+}
+
+bool NameHasTag(string name, string tag)
+{
+    return name != null && name.IndexOf(tag, StringComparison.OrdinalIgnoreCase) >= 0;
+}
+
+string FirstLine(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return "";
+    int i = text.IndexOf('\n');
+    return i < 0 ? text : text.Substring(0, i);
+}
+
+string SanitizePipe(string s)
+{
+    return (s ?? "").Replace("|", "/");
+}
+
+Dictionary<string, string> ParseKv(string raw)
+{
+    var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    var lines = raw.Split('\n');
+    for (int i = 0; i < lines.Length; i++)
+    {
+        string line = lines[i].Trim();
+        if (line.Length == 0 || line.StartsWith("#") || line.StartsWith(";") || line.StartsWith("["))
+            continue;
+        int eq = line.IndexOf('=');
+        if (eq <= 0) continue;
+        map[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+    }
+    return map;
+}
+
+string GetOrDefault(Dictionary<string, string> map, string key, string fallback)
+{
+    string value;
+    if (map.TryGetValue(key, out value) && !string.IsNullOrWhiteSpace(value))
+        return value;
+    return fallback;
+}
+
+int ParseInt(string raw, int fallback)
+{
+    int v;
+    if (int.TryParse(raw, out v))
+        return v;
+    return fallback;
+}
