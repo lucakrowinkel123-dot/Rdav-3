@@ -74,20 +74,10 @@ void RefreshBlocks()
     var flights = new List<IMyFlightMovementBlock>();
     GridTerminalSystem.GetBlocksOfType(flights, b => NameHasTag(b.CustomName, SourceTag));
     FlightBlock = flights.Count > 0 ? flights[0] : null;
-    if (FlightBlock == null)
-    {
-        GridTerminalSystem.GetBlocksOfType(flights);
-        FlightBlock = flights.Count > 0 ? flights[0] : null;
-    }
 
     var combats = new List<IMyOffensiveCombatBlock>();
     GridTerminalSystem.GetBlocksOfType(combats, b => NameHasTag(b.CustomName, SourceTag));
     CombatBlock = combats.Count > 0 ? combats[0] : null;
-    if (CombatBlock == null)
-    {
-        GridTerminalSystem.GetBlocksOfType(combats);
-        CombatBlock = combats.Count > 0 ? combats[0] : null;
-    }
 }
 
 void HandleManualArgument(string argument)
@@ -227,8 +217,6 @@ void EchoStatus()
     Echo("Armed: " + Armed);
     Echo("Flight: " + (FlightBlock != null ? "OK" : "MISSING"));
     Echo("Combat: " + (CombatBlock != null ? "OK" : "MISSING"));
-    if (FlightBlock == null || CombatBlock == null)
-        Echo("Tip: set SourceTag in CustomData to match AI block names, then run: refresh");
 }
 
 bool NameHasTag(string name, string tag)

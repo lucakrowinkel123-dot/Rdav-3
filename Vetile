@@ -246,8 +246,7 @@ bool HandleHubCommand(string argument)
 
     if (parts[0].Equals("priority", StringComparison.OrdinalIgnoreCase) && parts.Length >= 2)
     {
-        TargetPriorityMode parsed;
-        if (TryParsePriority(parts[1], out parsed))
+        if (TryParsePriority(parts[1], out var parsed))
         {
             globalTargetMode = parsed;
             foreach (var kv in channels)
@@ -466,8 +465,7 @@ void LoadHubConfig()
         activeSourceId = "#A#";
     subsystemMode = GetOrDefault(map, "subsystem", subsystemMode).ToLowerInvariant();
 
-    TargetPriorityMode parsedMode;
-    if (TryParsePriority(GetOrDefault(map, "priority", globalTargetMode.ToString()), out parsedMode))
+    if (TryParsePriority(GetOrDefault(map, "priority", globalTargetMode.ToString()), out var parsedMode))
         globalTargetMode = parsedMode;
 
     configuredRemoteSources.Clear();
